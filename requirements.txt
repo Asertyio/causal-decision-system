@@ -1,0 +1,10 @@
+econml==0.14.1
+scikit-learn==1.2.2
+pandas==1.5.3
+numpy==1.23.5
+matplotlib==3.6.3
+seaborn==0.12.2
+plotly==5.15.0
+streamlit==1.25.0
+shap==0.41.0
+joblib==1.2.0
