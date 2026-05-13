@@ -1,12 +1,11 @@
 # causal_model.py
 """Каузальная модель карьерного советника.
 
-Улучшения v2:
-- Отдельная бинарная CausalForestDML на каждое действие vs baseline (п. 2)
-- Исключение current_salary / job_satisfaction / work_life_balance из ковариат (п. 3)
-- Добавлены interaction features age_x_skills, exp_x_edu (п. 6)
-- Категория уверенности (высокая/средняя/низкая) по ширине ДИ (п. 5)
-- Кэширование модели через joblib (п. 10)
+Исправления:
+- Персонализированный baseline через отдельную регрессию (п.2)
+- Обучение на всех горизонтах 6m/1y/2y (п.1)
+- Быстрый режим улучшен (n_estimators_first=80) (п.6)
+- Сохранение baseline-моделей вместе с CATE-моделями
 """
 import numpy as np
 import pandas as pd
@@ -15,7 +14,6 @@ import os
 from econml.dml import CausalForestDML
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
-# Full action list — must match data_synthetic.py and app.py exactly
 ALL_ACTIONS = [
     'Остаться на текущем месте',
     'Сменить работу (та же отрасль)',
@@ -51,31 +49,23 @@ ALL_ACTIONS = [
 
 BASELINE_ACTION = 'Остаться на текущем месте'
 
-# ── УЛУЧШЕНИЕ 3: Baseline-значения исключены из признаков модели ──
-# Эти колонки используются только в outcome generation, не как ковариаты.
 _LEAKY_COLS = {'current_salary', 'job_satisfaction', 'work_life_balance'}
 
 
 def get_default_feature_cols():
-    """Ковариаты модели — без утечки данных."""
     return [
         'age', 'gender', 'region', 'education_years', 'has_master', 'has_phd',
         'has_certificate', 'total_experience', 'industry_experience',
         'current_job_tenure', 'num_previous_jobs', 'current_industry',
         'job_level', 'skills_count',
         'experience_gap', 'job_stability',
-        # Interaction features (п. 6)
         'age_x_skills', 'exp_x_edu',
     ]
 
 
 def confidence_label(ci_width: float, outcome: str) -> str:
-    """Категория уверенности прогноза по ширине ДИ (п. 5).
-
-    Пороги подобраны отдельно для каждого типа исхода.
-    """
     thresholds = {
-        'salary': (20, 50),       # тыс. руб.
+        'salary': (20, 50),
         'satisfaction': (1.5, 3.0),
         'promoted': (0.15, 0.30),
         'wlb': (1.5, 3.0),
@@ -88,25 +78,20 @@ def confidence_label(ci_width: float, outcome: str) -> str:
                 return '🟡 Средняя'
             else:
                 return '🔴 Низкая'
-    # fallback
     return '🟡 Средняя'
 
 
 class CausalModelTrainer:
-    """Обучает отдельный CausalForestDML для каждого действия (бинарный T).
-
-    Улучшение п. 2: вместо одного многоклассового леса — по одному бинарному
-    лесу на каждое действие vs baseline.  Это даёт более чистые CATE и
-    позволяет параллельно обучать независимые модели.
+    """Обучает бинарные CausalForestDML для каждой пары (действие, исход)
+    и регрессионную baseline-модель для персонализированных прогнозов.
     """
-
     def __init__(self, random_state=42, n_estimators=32, fast_mode=True, high_precision=False):
         self.random_state = random_state
         self.n_estimators = n_estimators
         self.fast_mode = fast_mode
         self.high_precision = high_precision
-        # models[action][outcome] = fitted CausalForestDML
-        self.models: dict = {}
+        self.models: dict = {}                    # models[action][outcome] = CausalForestDML
+        self.baseline_models: dict = {}           # baseline_models[outcome] = RandomForestRegressor
         self.is_fitted = False
         self.treatment_names = ALL_ACTIONS
         self.available_treatment_names: list = []
@@ -121,27 +106,21 @@ class CausalModelTrainer:
                 "max_depth": 15,
                 "min_samples_leaf": 10,
                 "n_estimators": 150,
-                "n_estimators_first": 100,
+                "n_estimators_first": 200,
             }
         else:
             return {
                 "cv": 2,
-                "max_depth": 4,
+                "max_depth": 6,
                 "min_samples_leaf": 30,
-                "n_estimators": 20,
-                "n_estimators_first": 20,
+                "n_estimators": 40,
+                "n_estimators_first": 80,       # увеличено с 20 до 80
             }
 
     def fit(self, data: pd.DataFrame, outcome_cols: list, treatment_col: str = 'treatment',
             feature_cols: list = None):
-        """Train one binary CausalForestDML per (action, outcome) pair.
-
-        Для каждого действия выбираются строки: treated (это действие) + control
-        (baseline).  Обучается бинарная DML T∈{0,1}.
-        """
         if feature_cols is None:
             feature_cols = get_default_feature_cols()
-        # Filter out any leaky columns that may have slipped in
         feature_cols = [c for c in feature_cols if c not in _LEAKY_COLS and c in data.columns]
         self.feature_names = feature_cols
 
@@ -156,20 +135,32 @@ class CausalModelTrainer:
         baseline_mask = data[treatment_col] == baseline
         X_base = X_full[baseline_mask].values
 
+        # Обучаем персонализированные baseline-модели для каждого исхода
         for outcome in outcome_cols:
-            Y_base = data.loc[baseline_mask, outcome].values.astype(float)
-            self.baseline_means[outcome] = float(Y_base.mean()) if len(Y_base) > 0 else 0.0
+            y_base = data.loc[baseline_mask, outcome].values.astype(float)
+            self.baseline_means[outcome] = float(y_base.mean()) if len(y_base) > 0 else 0.0
+            # Обучаем RandomForestRegressor для предсказания базового исхода
+            if len(y_base) > 10:
+                reg = RandomForestRegressor(
+                    n_estimators=min(100, params['n_estimators_first']),
+                    max_depth=params['max_depth'],
+                    min_samples_leaf=params['min_samples_leaf'],
+                    random_state=self.random_state,
+                    n_jobs=-1
+                )
+                reg.fit(X_base, y_base)
+                self.baseline_models[outcome] = reg
+            else:
+                self.baseline_models[outcome] = None
 
-        available = []
+        # Обучаем CATE-модели для каждой пары (действие, исход), кроме baseline
+        available = [baseline]
         for action in ALL_ACTIONS:
             if action == baseline:
-                # Baseline stored separately; still counts as available
-                available.append(action)
                 continue
             treated_mask = data[treatment_col] == action
             if treated_mask.sum() < 5:
-                continue  # too few samples — skip
-
+                continue
             combined_mask = baseline_mask | treated_mask
             X_comb = X_full[combined_mask].values
             T_comb = treated_mask[combined_mask].values.astype(int)
@@ -200,10 +191,9 @@ class CausalModelTrainer:
                 )
                 model.fit(Y=Y_comb, T=T_comb, X=X_comb, W=None)
                 self.models[action][outcome] = model
-
             available.append(action)
 
-        self.available_treatment_names = [a for a in ALL_ACTIONS if a in available]
+        self.available_treatment_names = available
         self.is_fitted = True
 
     # ------------------------------------------------------------------
@@ -212,16 +202,10 @@ class CausalModelTrainer:
 
     def predict_absolute(self, X_df: pd.DataFrame, actions: list = None,
                          alpha: float = 0.05) -> dict:
-        """Return predicted absolute outcome values for each action.
-
-        Returns
-        -------
-        dict keyed by outcome name, each value a dict with
-        'effect', 'lower', 'upper' — DataFrames (n_rows × n_actions).
-        """
         if not self.is_fitted:
-            raise ValueError("Model not trained yet. Call fit() first.")
+            raise ValueError("Модель не обучена. Вызовите fit().")
 
+        # One-hot encoding
         X_proc = pd.get_dummies(X_df, drop_first=True)
         for col in self.feature_names_after_ohe:
             if col not in X_proc.columns:
@@ -231,42 +215,40 @@ class CausalModelTrainer:
 
         if actions is None:
             actions = self.available_treatment_names
+        else:
+            # Оставляем только доступные действия
+            actions = [a for a in actions if a in self.available_treatment_names]
 
-        unknown = [a for a in actions if a not in self.available_treatment_names]
-        if unknown:
-            raise ValueError(
-                f"Actions not in trained model: {unknown}\n"
-                f"Available: {self.available_treatment_names}"
-            )
-
-        outcome_cols = list(next(iter(self.models.values())).keys()) if self.models else []
-        # Also collect outcomes from baseline_means
-        all_outcomes = list(self.baseline_means.keys())
-
+        all_outcomes = list(self.baseline_models.keys())
         results = {outcome: {'effect': {}, 'lower': {}, 'upper': {}} for outcome in all_outcomes}
 
         for outcome in all_outcomes:
-            baseline_mean = self.baseline_means[outcome]
+            # Персонализированный baseline: предсказание базовой модели
+            baseline_reg = self.baseline_models.get(outcome)
+            if baseline_reg is not None:
+                base_pred = baseline_reg.predict(X_arr)
+            else:
+                base_pred = np.full(len(X_arr), self.baseline_means.get(outcome, 0.0))
+
             for act in actions:
                 n = len(X_arr)
                 if act == BASELINE_ACTION or act not in self.models:
-                    # Baseline — CATE = 0 by definition
-                    results[outcome]['effect'][act] = np.full(n, baseline_mean)
-                    results[outcome]['lower'][act] = np.full(n, baseline_mean)
-                    results[outcome]['upper'][act] = np.full(n, baseline_mean)
+                    # Для baseline CATE = 0
+                    results[outcome]['effect'][act] = base_pred.copy()
+                    results[outcome]['lower'][act] = base_pred.copy()
+                    results[outcome]['upper'][act] = base_pred.copy()
                 else:
                     model = self.models[act][outcome]
-                    # Binary DML: T=1 is the action; CATE shape (n,) or (n,1)
                     cate = model.const_marginal_effect(X_arr)
-                    cate_lo, cate_hi = model.const_marginal_effect_interval(X_arr, alpha=alpha)
                     cate = np.squeeze(cate)
+                    cate_lo, cate_hi = model.const_marginal_effect_interval(X_arr, alpha=alpha)
                     cate_lo = np.squeeze(cate_lo)
                     cate_hi = np.squeeze(cate_hi)
-                    results[outcome]['effect'][act] = baseline_mean + cate
-                    results[outcome]['lower'][act] = baseline_mean + cate_lo
-                    results[outcome]['upper'][act] = baseline_mean + cate_hi
+                    results[outcome]['effect'][act] = base_pred + cate
+                    results[outcome]['lower'][act] = base_pred + cate_lo
+                    results[outcome]['upper'][act] = base_pred + cate_hi
 
-        # Convert inner dicts to DataFrames
+        # Преобразуем в DataFrame
         for outcome in all_outcomes:
             for key in ('effect', 'lower', 'upper'):
                 results[outcome][key] = pd.DataFrame(results[outcome][key]).reset_index(drop=True)
@@ -275,7 +257,6 @@ class CausalModelTrainer:
 
     def predict_with_confidence(self, X_df: pd.DataFrame, actions: list = None,
                                 alpha: float = 0.05) -> dict:
-        """predict_absolute + confidence labels per (action, outcome) pair."""
         raw = self.predict_absolute(X_df, actions=actions, alpha=alpha)
         confidence = {}
         for outcome, data in raw.items():
@@ -288,28 +269,28 @@ class CausalModelTrainer:
         return raw, confidence
 
     # ------------------------------------------------------------------
-    # Persistence (п. 10)
+    # Persistence
     # ------------------------------------------------------------------
 
     def save_model(self, filepath: str):
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         joblib.dump({
             'models': self.models,
+            'baseline_models': self.baseline_models,
             'treatment_names': self.treatment_names,
             'available_treatment_names': self.available_treatment_names,
             'feature_names': self.feature_names,
             'feature_names_after_ohe': self.feature_names_after_ohe,
             'baseline_means': self.baseline_means,
         }, filepath)
-        print(f"Model saved to {filepath}")
 
     def load_model(self, filepath: str):
         data = joblib.load(filepath)
         self.models = data['models']
+        self.baseline_models = data.get('baseline_models', {})
         self.treatment_names = data['treatment_names']
         self.available_treatment_names = data['available_treatment_names']
         self.feature_names = data['feature_names']
         self.feature_names_after_ohe = data['feature_names_after_ohe']
         self.baseline_means = data.get('baseline_means', {})
         self.is_fitted = True
-        print(f"Model loaded from {filepath}")

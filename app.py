@@ -1,38 +1,29 @@
 # app.py
-"""Карьерный советник v4.0
-
-Улучшения:
-- п.5  Категория уверенности (Высокая/Средняя/Низкая) под каждой метрикой
-- п.7  Автоматические SHAP-объяснения топ-3 факторов без чекбокса
-- п.8  Сравнение сценариев: выбор нескольких действий + таблица / spider
-- п.9  Профиль риска: ширина ДИ как "риск"
-- п.10 Кэширование модели на диск (сохранить / загрузить)
-- п.11 Вкладка «Качество модели» с calibration curve и метриками
-- п.4  Временна́я динамика: 6 мес / 1 год / 2 года
+"""Карьерный советник v5.0 — полная версия.
 """
 import os
 import streamlit as st
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 
 from data_synthetic import generate_career_data
-from causal_model import CausalModelTrainer, get_default_feature_cols
+from causal_model import CausalModelTrainer, get_default_feature_cols, BASELINE_ACTION
+from services.prediction_service import (
+    get_all_outcome_columns,
+    resolve_outcome_columns,
+    prepare_user_features,
+    HORIZON_MAP,
+)
+from interpreter import ModelInterpreter
 
 MODEL_CACHE_PATH = "saved_model/career_model.pkl"
 
-
-# ── Вспомогательная функция должна быть определена ДО вызова (п.7) ──
+# ── Быстрые эвристики для SHAP-текста (п.7) ──
 def _build_shap_text(action: str, age: int, region: str, skills: int,
                      edu_years: int, exp: int, job_level: str) -> str:
-    """Правиловое объяснение топ-3 персональных факторов (п.7).
-
-    SHAP — тяжёлая операция; для быстрого UX используем детерминированные
-    эвристики, отражающие реальные эффекты из data_synthetic.
-    """
     reasons = []
     is_moscow = region in ['Москва', 'Санкт-Петербург']
 
@@ -119,10 +110,11 @@ with st.sidebar:
     if train_btn:
         mode_label = "Точный (~3 мин)" if high_precision else "Быстрый (~20 сек)"
         with st.spinner(f"Режим: {mode_label}. Генерация данных и обучение модели..."):
-            n_rows = 5000 if high_precision else 1500
+            n_rows = 5000 if high_precision else 3000
             df = generate_career_data(n=n_rows)
             st.session_state['data'] = df
-            outcome_cols = ['salary_2y', 'satisfaction_2y', 'promoted_2y', 'wlb_2y']
+            # Обучаем на ВСЕХ горизонтах (6m/1y/2y) для всех исходов
+            outcome_cols = get_all_outcome_columns()
             feature_cols = get_default_feature_cols()
             trainer = CausalModelTrainer(high_precision=high_precision, fast_mode=not high_precision)
             trainer.fit(df, outcome_cols, treatment_col='treatment', feature_cols=feature_cols)
@@ -141,8 +133,8 @@ with st.sidebar:
         with st.spinner("Загружаем сохранённую модель..."):
             trainer = CausalModelTrainer()
             trainer.load_model(MODEL_CACHE_PATH)
-            df = generate_career_data(n=500)  # small dataset for background
-            st.session_state['data'] = df
+            # Фоновый датасет не генерируем лишний раз
+            st.session_state['data'] = None
             st.session_state['trainer'] = trainer
             st.session_state['available_actions'] = trainer.available_treatment_names
         st.success("✅ Модель загружена с диска!")
@@ -283,33 +275,12 @@ with tab_main:
         index=2,
         horizontal=True
     )
-    horizon_map = {"6 месяцев": "6m", "1 год": "1y", "2 года": "2y"}
-    horizon_key = horizon_map[horizon]
+    horizon_key = HORIZON_MAP[horizon]
 
-    # Outcome column names depend on horizon
-    outcome_map = {
-        "6m": {'salary': 'salary_6m', 'satisfaction': 'satisfaction_6m',
-               'promoted': 'promoted_6m', 'wlb': 'wlb_6m'},
-        "1y": {'salary': 'salary_1y', 'satisfaction': 'satisfaction_1y',
-               'promoted': 'promoted_1y', 'wlb': 'wlb_1y'},
-        "2y": {'salary': 'salary_2y', 'satisfaction': 'satisfaction_2y',
-               'promoted': 'promoted_2y', 'wlb': 'wlb_2y'},
-    }
-    # The trainer is always trained on 2y outcomes; for 6m/1y we use separate outcome cols
-    # if they were included in training, otherwise fall back to 2y
     trainer = st.session_state['trainer']
-    oc = outcome_map[horizon_key]
-    # Check availability; fallback to 2y
+    # Все исходы, обученные в модели
     available_outcomes = list(trainer.baseline_means.keys())
-
-    def resolve_outcome(key):
-        col = oc[key]
-        return col if col in available_outcomes else f"{key}_2y" if f"{key}_2y" in available_outcomes else available_outcomes[0]
-
-    sal_col = resolve_outcome('salary')
-    sat_col = resolve_outcome('satisfaction')
-    prom_col = resolve_outcome('promoted')
-    wlb_col = resolve_outcome('wlb')
+    oc = resolve_outcome_columns(available_outcomes, horizon_key)
 
     submitted = st.button("🚀 Спрогнозировать", type="primary", use_container_width=True)
 
@@ -327,61 +298,45 @@ with tab_main:
             has_master = 1 if education in ["Магистр", "Кандидат/Доктор наук"] else 0
             has_phd = 1 if education == "Кандидат/Доктор наук" else 0
 
-            user_df = pd.DataFrame([{
-                'age': age,
-                'gender': gender,
-                'region': region,
-                'education_years': education_years,
-                'has_master': has_master,
-                'has_phd': has_phd,
-                'has_certificate': int(has_certificate),
-                'total_experience': total_exp,
-                'industry_experience': industry_exp,
-                'current_job_tenure': current_tenure,
-                'num_previous_jobs': prev_jobs,
-                'current_industry': industry,
-                'job_level': job_level,
-                'skills_count': skills,
-                'experience_gap': total_exp - industry_exp,
-                'job_stability': current_tenure / (total_exp + 1),
-                'age_x_skills': age * skills / 100.0,
-                'exp_x_edu': total_exp * education_years / 10.0,
-            }])
+            user_df = prepare_user_features(
+                age, gender, region, education_years, has_master, has_phd,
+                has_certificate, total_exp, industry_exp, current_tenure,
+                prev_jobs, industry, job_level, skills
+            )
 
-            # Predict for all + confidence
             effects, confidence = trainer.predict_with_confidence(user_df)
 
-            baseline_action = "Остаться на текущем месте"
-            if baseline_action not in effects[sal_col]['effect'].columns:
-                baseline_action = effects[sal_col]['effect'].columns[0]
+            baseline_action = BASELINE_ACTION
+            if baseline_action not in effects[oc['salary']]['effect'].columns:
+                baseline_action = effects[oc['salary']]['effect'].columns[0]
 
-        # ── Metrics for each selected action ──
+        # ── Метрики для каждого выбранного действия ──
         st.markdown("---")
         st.subheader(f"📊 Прогноз: {horizon}")
 
         for act in selected_actions:
-            if act not in effects[sal_col]['effect'].columns:
+            if act not in effects[oc['salary']]['effect'].columns:
                 st.error(f"Действие '{act}' недоступно. Переобучите модель.")
                 continue
 
             with st.expander(f"**{act}**", expanded=True):
-                salary_pred  = effects[sal_col]['effect'].iloc[0][act]
-                salary_lb    = effects[sal_col]['lower'].iloc[0][act]
-                salary_ub    = effects[sal_col]['upper'].iloc[0][act]
-                sat_pred     = effects[sat_col]['effect'].iloc[0][act]
-                sat_lb       = effects[sat_col]['lower'].iloc[0][act]
-                sat_ub       = effects[sat_col]['upper'].iloc[0][act]
-                promo_pred   = effects[prom_col]['effect'].iloc[0][act]
-                promo_lb     = effects[prom_col]['lower'].iloc[0][act]
-                promo_ub     = effects[prom_col]['upper'].iloc[0][act]
-                wlb_pred     = effects[wlb_col]['effect'].iloc[0][act]
-                wlb_lb       = effects[wlb_col]['lower'].iloc[0][act]
-                wlb_ub       = effects[wlb_col]['upper'].iloc[0][act]
+                salary_pred  = effects[oc['salary']]['effect'].iloc[0][act]
+                salary_lb    = effects[oc['salary']]['lower'].iloc[0][act]
+                salary_ub    = effects[oc['salary']]['upper'].iloc[0][act]
+                sat_pred     = effects[oc['satisfaction']]['effect'].iloc[0][act]
+                sat_lb       = effects[oc['satisfaction']]['lower'].iloc[0][act]
+                sat_ub       = effects[oc['satisfaction']]['upper'].iloc[0][act]
+                promo_pred   = effects[oc['promoted']]['effect'].iloc[0][act]
+                promo_lb     = effects[oc['promoted']]['lower'].iloc[0][act]
+                promo_ub     = effects[oc['promoted']]['upper'].iloc[0][act]
+                wlb_pred     = effects[oc['wlb']]['effect'].iloc[0][act]
+                wlb_lb       = effects[oc['wlb']]['lower'].iloc[0][act]
+                wlb_ub       = effects[oc['wlb']]['upper'].iloc[0][act]
 
-                base_sal  = effects[sal_col]['effect'].iloc[0][baseline_action]
-                base_sat  = effects[sat_col]['effect'].iloc[0][baseline_action]
-                base_prom = effects[prom_col]['effect'].iloc[0][baseline_action]
-                base_wlb  = effects[wlb_col]['effect'].iloc[0][baseline_action]
+                base_sal  = effects[oc['salary']]['effect'].iloc[0][baseline_action]
+                base_sat  = effects[oc['satisfaction']]['effect'].iloc[0][baseline_action]
+                base_prom = effects[oc['promoted']]['effect'].iloc[0][baseline_action]
+                base_wlb  = effects[oc['wlb']]['effect'].iloc[0][baseline_action]
 
                 salary_delta = salary_pred - base_sal
                 sat_delta    = sat_pred - base_sat
@@ -393,23 +348,22 @@ with tab_main:
                     st.metric("💰 Зарплата (тыс. руб)", f"{salary_pred:.1f}",
                               delta=f"{salary_delta:+.1f}", delta_color="normal")
                     st.caption(f"95% ДИ: [{salary_lb:.1f}, {salary_ub:.1f}]")
-                    # ── п.5: Категория уверенности ──
-                    st.caption(f"Уверенность: {confidence[sal_col].get(act, '—')}")
+                    st.caption(f"Уверенность: {confidence[oc['salary']].get(act, '—')}")
                 with c2:
                     st.metric("😊 Удовлетворённость", f"{sat_pred:.1f}",
                               delta=f"{sat_delta:+.1f}", delta_color="normal")
                     st.caption(f"95% ДИ: [{sat_lb:.1f}, {sat_ub:.1f}]")
-                    st.caption(f"Уверенность: {confidence[sat_col].get(act, '—')}")
+                    st.caption(f"Уверенность: {confidence[oc['satisfaction']].get(act, '—')}")
                 with c3:
                     st.metric("📈 Вероятность повышения", f"{promo_pred*100:.1f}%",
                               delta=f"{promo_delta*100:+.1f} п.п.", delta_color="normal")
                     st.caption(f"95% ДИ: [{promo_lb*100:.1f}%, {promo_ub*100:.1f}%]")
-                    st.caption(f"Уверенность: {confidence[prom_col].get(act, '—')}")
+                    st.caption(f"Уверенность: {confidence[oc['promoted']].get(act, '—')}")
                 with c4:
                     st.metric("⚖️ Баланс работы/жизни", f"{wlb_pred:.1f}",
                               delta=f"{wlb_delta:+.1f}", delta_color="inverse")
                     st.caption(f"95% ДИ: [{wlb_lb:.1f}, {wlb_ub:.1f}]")
-                    st.caption(f"Уверенность: {confidence[wlb_col].get(act, '—')}")
+                    st.caption(f"Уверенность: {confidence[oc['wlb']].get(act, '—')}")
 
                 # ── п.9: Профиль риска ──
                 risk_width = salary_ub - salary_lb
@@ -423,7 +377,28 @@ with tab_main:
                                                     total_exp, job_level)
                 st.markdown(f"**💡 Почему именно для вас:** {top3_explanation}")
 
-        # ── п.4: Временна́я динамика — график ──
+                # ── Кнопка для подробного SHAP-анализа (п.3 исправлен) ──
+                if st.button(f"🔬 Подробный SHAP-анализ для «{act}»", key=f"shap_{act}"):
+                    with st.spinner("Строим график SHAP (это может занять несколько секунд)..."):
+                        # Подготовка one-hot encoded признаков как в модели
+                        X_proc = pd.get_dummies(user_df, drop_first=True)
+                        for col in trainer.feature_names_after_ohe:
+                            if col not in X_proc.columns:
+                                X_proc[col] = 0
+                        X_proc = X_proc[trainer.feature_names_after_ohe].astype(float)
+
+                        # Создаём интерпретатор для данного действия и исхода
+                        outcome_for_shap = oc['salary']
+                        interpreter = ModelInterpreter(
+                            model=trainer.models[act][outcome_for_shap],
+                            background_X=X_proc.values,  # используем самого пользователя как фон (упрощение)
+                            feature_names=trainer.feature_names_after_ohe
+                        )
+                        fig = interpreter.plot_waterfall(X_proc.values, idx=0, max_display=10)
+                        st.pyplot(fig)
+                        plt.close(fig)
+
+        # ── п.4: Временна́я динамика (исправлена) ──
         if 'salary_6m' in available_outcomes and 'salary_1y' in available_outcomes:
             st.markdown("---")
             st.subheader("📈 Динамика зарплаты по времени")
@@ -433,11 +408,11 @@ with tab_main:
 
             for act in selected_actions:
                 sal_vals = []
-                for h in horizons_plot:
-                    oc_h = outcome_map[h]['salary']
-                    oc_h = oc_h if oc_h in available_outcomes else 'salary_2y'
-                    if act in effects[oc_h]['effect'].columns:
-                        sal_vals.append(effects[oc_h]['effect'].iloc[0][act])
+                for hk in horizons_plot:
+                    hk_col = f'salary_{hk}'
+                    # Используем предсказания для каждого горизонта, если они есть
+                    if hk_col in effects and act in effects[hk_col]['effect'].columns:
+                        sal_vals.append(effects[hk_col]['effect'][act].iloc[0])
                     else:
                         sal_vals.append(None)
                 fig_time.add_trace(go.Scatter(
@@ -457,22 +432,23 @@ with tab_main:
         st.subheader("📋 Сравнение сценариев")
         compare_rows = []
         for act in selected_actions:
-            if act not in effects[sal_col]['effect'].columns:
+            if act not in effects[oc['salary']]['effect'].columns:
                 continue
             row = {
                 'Действие': act,
-                'Зарплата': f"{effects[sal_col]['effect'].iloc[0][act]:.1f}",
-                'Удовлетворённость': f"{effects[sat_col]['effect'].iloc[0][act]:.1f}",
-                'Повышение': f"{effects[prom_col]['effect'].iloc[0][act]*100:.1f}%",
-                'WLB': f"{effects[wlb_col]['effect'].iloc[0][act]:.1f}",
-                'Риск (ДИ зарплаты)': f"{(effects[sal_col]['upper'].iloc[0][act] - effects[sal_col]['lower'].iloc[0][act]):.0f} тыс",
+                'Зарплата': f"{effects[oc['salary']]['effect'][act].iloc[0]:.1f}",
+                'Удовлетворённость': f"{effects[oc['satisfaction']]['effect'][act].iloc[0]:.1f}",
+                'Повышение': f"{effects[oc['promoted']]['effect'][act].iloc[0]*100:.1f}%",
+                'WLB': f"{effects[oc['wlb']]['effect'][act].iloc[0]:.1f}",
+                'Риск (ДИ зарплаты)': f"{(effects[oc['salary']]['upper'][act].iloc[0] - effects[oc['salary']]['lower'][act].iloc[0]):.0f} тыс",
             }
             compare_rows.append(row)
         if compare_rows:
             st.dataframe(pd.DataFrame(compare_rows).set_index('Действие'), use_container_width=True)
 
-        # ── Spider chart ──
+        # ── Spider chart (п.8) с предупреждением о нормировке ──
         if len(selected_actions) >= 1:
+            st.markdown("*Нормировано относительно выбранных действий.*")
             categories = ['Зарплата (норм.)', 'Удовлетворённость', 'Повышение × 100', 'WLB']
 
             def _normalize(values):
@@ -480,14 +456,14 @@ with tab_main:
                 mn, mx = arr.min(), arr.max()
                 return (arr - mn) / (mx - mn + 1e-8)
 
-            all_sal  = [effects[sal_col]['effect'].iloc[0][a] for a in selected_actions if a in effects[sal_col]['effect'].columns]
-            all_sat  = [effects[sat_col]['effect'].iloc[0][a] for a in selected_actions if a in effects[sat_col]['effect'].columns]
-            all_prom = [effects[prom_col]['effect'].iloc[0][a]*100 for a in selected_actions if a in effects[prom_col]['effect'].columns]
-            all_wlb  = [effects[wlb_col]['effect'].iloc[0][a] for a in selected_actions if a in effects[wlb_col]['effect'].columns]
+            all_sal  = [effects[oc['salary']]['effect'].iloc[0][a] for a in selected_actions if a in effects[oc['salary']]['effect'].columns]
+            all_sat  = [effects[oc['satisfaction']]['effect'].iloc[0][a] for a in selected_actions if a in effects[oc['satisfaction']]['effect'].columns]
+            all_prom = [effects[oc['promoted']]['effect'].iloc[0][a]*100 for a in selected_actions if a in effects[oc['promoted']]['effect'].columns]
+            all_wlb  = [effects[oc['wlb']]['effect'].iloc[0][a] for a in selected_actions if a in effects[oc['wlb']]['effect'].columns]
 
             fig_radar = go.Figure()
             for idx, act in enumerate(selected_actions):
-                if act not in effects[sal_col]['effect'].columns:
+                if act not in effects[oc['salary']]['effect'].columns:
                     continue
                 r = [
                     _normalize(all_sal)[idx] if all_sal else 0,
@@ -511,13 +487,13 @@ with tab_main:
         # ── Рекомендация ──
         if selected_actions:
             main_act = selected_actions[0]
-            if main_act in effects[sal_col]['effect'].columns:
-                salary_delta_main = (effects[sal_col]['effect'].iloc[0][main_act] -
-                                     effects[sal_col]['effect'].iloc[0][baseline_action])
-                sat_delta_main    = (effects[sat_col]['effect'].iloc[0][main_act] -
-                                     effects[sat_col]['effect'].iloc[0][baseline_action])
-                wlb_delta_main    = (effects[wlb_col]['effect'].iloc[0][main_act] -
-                                     effects[wlb_col]['effect'].iloc[0][baseline_action])
+            if main_act in effects[oc['salary']]['effect'].columns:
+                salary_delta_main = (effects[oc['salary']]['effect'][main_act].iloc[0] -
+                                     effects[oc['salary']]['effect'][baseline_action].iloc[0])
+                sat_delta_main    = (effects[oc['satisfaction']]['effect'][main_act].iloc[0] -
+                                     effects[oc['satisfaction']]['effect'][baseline_action].iloc[0])
+                wlb_delta_main    = (effects[oc['wlb']]['effect'][main_act].iloc[0] -
+                                     effects[oc['wlb']]['effect'][baseline_action].iloc[0])
 
                 st.markdown("---")
                 st.subheader("💡 Рекомендация")
@@ -538,10 +514,10 @@ with tab_main:
         actions_show = st.session_state['available_actions']
         salary_preds, salary_lower, salary_upper, labels = [], [], [], []
         for a in actions_show:
-            if a in effects[sal_col]['effect'].columns:
-                salary_preds.append(effects[sal_col]['effect'].iloc[0][a])
-                salary_lower.append(effects[sal_col]['lower'].iloc[0][a])
-                salary_upper.append(effects[sal_col]['upper'].iloc[0][a])
+            if a in effects[oc['salary']]['effect'].columns:
+                salary_preds.append(effects[oc['salary']]['effect'][a].iloc[0])
+                salary_lower.append(effects[oc['salary']]['lower'][a].iloc[0])
+                salary_upper.append(effects[oc['salary']]['upper'][a].iloc[0])
                 labels.append(a)
 
         fig_bar = go.Figure()
@@ -575,7 +551,6 @@ with tab_quality:
         if st.button("🔬 Рассчитать метрики качества"):
             with st.spinner("Генерация тестовой выборки и расчёт метрик..."):
                 from validator import compute_metrics, calibration_test
-                from sklearn.model_selection import train_test_split
 
                 df_val = generate_career_data(n=2000, random_state=99)
                 df_train_v, df_test_v = train_test_split(df_val, test_size=0.3, random_state=42)
@@ -584,7 +559,7 @@ with tab_quality:
                 feature_cols_v = get_default_feature_cols()
                 available_fc = [c for c in feature_cols_v if c in df_test_v.columns]
 
-                # Metrics for salary_2y
+                # Метрики для salary_2y
                 outcome = 'salary_2y'
                 if outcome in trainer_v.baseline_means:
                     preds = trainer_v.predict_absolute(df_test_v[available_fc])
@@ -604,7 +579,7 @@ with tab_quality:
                             c2.metric("R²", f"{metrics['R2']:.4f}")
                             c3.metric("Pearson R", f"{metrics['PearsonR']:.4f}")
 
-                            # Calibration curve
+                            # Калибровочная кривая (усреднённая по нескольким действиям)
                             cal = calibration_test(trainer_v, df_test_v, outcome=outcome,
                                                    treatment_col='treatment')
                             valid_bins = ~np.isnan(cal['actual'])
@@ -626,15 +601,15 @@ with tab_quality:
                                     name='Идеальная калибровка'
                                 ))
                                 fig_cal.update_layout(
-                                    title=f"Calibration curve ({outcome})",
-                                    xaxis_title="Predicted CATE (bin mean)",
-                                    yaxis_title="Actual effect (bin mean)",
+                                    title=f"Калибровочная кривая ({outcome})",
+                                    xaxis_title="Предсказанный CATE (по бинам)",
+                                    yaxis_title="Фактический эффект (по бинам)",
                                     plot_bgcolor='rgba(0,0,0,0)',
                                     paper_bgcolor='rgba(0,0,0,0)',
                                 )
                                 st.plotly_chart(fig_cal, use_container_width=True)
                                 st.caption(
-                                    f"Корреляция предсказанных и фактических CATE: "
+                                    f"Средняя корреляция предсказанных и фактических CATE по действиям: "
                                     f"{cal['correlation']:.3f}"
                                 )
                         else:
@@ -646,6 +621,6 @@ with tab_quality:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #64748b; padding: 1rem;'>
-    Карьерный советник v4.0 · Прогнозы основаны на синтетических данных и каузальном лесе · Для демонстрационных целей
+    Карьерный советник v5.0 · Прогнозы основаны на синтетических данных и каузальном лесе · Для демонстрационных целей
 </div>
 """, unsafe_allow_html=True)

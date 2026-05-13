@@ -1,118 +1,245 @@
 # interpreter.py
-"""SHAP-based explainability for the causal career model.
+"""SHAP-интерпретатор для бинарных CausalForestDML моделей карьерного советника.
 
-CausalForestDML's const_marginal_effect() returns a (n, K) matrix where
-K = number of non-baseline treatment categories.  We expose per-action
-waterfall plots by selecting the appropriate column of the SHAP output.
+Совместим с архитектурой causal_model1.py:
+  trainer.models[action][outcome] = CausalForestDML (бинарный T∈{0,1})
+  trainer.baseline_models[outcome] = RandomForestRegressor
+
+Каждый экземпляр ModelInterpreter привязан к конкретной паре (action, outcome).
+Для объяснения нескольких действий создавайте отдельные экземпляры или
+используйте фабричную функцию make_interpreter().
 """
 import shap
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
+from typing import Optional
 
 
 class ModelInterpreter:
-    """Wraps a trained CausalModelTrainer and computes SHAP explanations.
+    """Объясняет CATE конкретной пары (action, outcome) с помощью SHAP.
+
+    Архитектура causal_model1.py использует отдельный бинарный CausalForestDML
+    на каждую пару (действие, исход), поэтому const_marginal_effect() возвращает
+    shape (n,) или (n, 1) — скалярный CATE без мультиклассовой индексации.
 
     Parameters
     ----------
-    trainer : CausalModelTrainer  – already fitted trainer.
-    X_background : np.ndarray     – background sample for the SHAP kernel (n_bg, n_features).
-    feature_names : list[str]     – feature names after one-hot encoding.
-    outcome : str                 – which outcome model to explain (default 'salary_2y').
+    model        : обученный CausalForestDML для данной пары (action, outcome).
+    background_X : np.ndarray shape (n_bg, n_features) — фоновая выборка для SHAP.
+    feature_names: list[str] — имена признаков после OHE.
+    action_name  : str — человекочитаемое название действия (для заголовков).
+    outcome_name : str — человекочитаемое название исхода (для заголовков).
+    n_background : int — сколько строк из background_X использовать (для скорости).
     """
 
-    def __init__(self, trainer, X_background: np.ndarray, feature_names: list,
-                 outcome: str = 'salary_2y'):
-        self.trainer = trainer
+    def __init__(
+        self,
+        model,
+        background_X: np.ndarray,
+        feature_names: list,
+        action_name: str = "",
+        outcome_name: str = "",
+        n_background: int = 100,
+    ):
+        self.model = model
         self.feature_names = feature_names
-        self.outcome = outcome
+        self.action_name = action_name
+        self.outcome_name = outcome_name
 
-        if outcome not in trainer.models:
-            raise ValueError(f"Outcome '{outcome}' not found in trainer.models. "
-                             f"Available: {list(trainer.models.keys())}")
-        self.model = trainer.models[outcome]
-        self.available_treatment_names = trainer.available_treatment_names
-        self.treatment_name_to_idx = trainer.treatment_name_to_idx
+        # Обёртка: бинарный DML возвращает (n,) или (n,1) → всегда (n,)
+        def _predict_fn(X: np.ndarray) -> np.ndarray:
+            cate = model.const_marginal_effect(X)
+            return np.squeeze(cate)  # (n,)
 
-        # BUG FIX: const_marginal_effect returns shape (n, K) — a multi-output function.
-        # We wrap it to return a 1-D array (one CATE value per sample) for a specific
-        # action column, so SHAP receives a scalar output per sample.
-        # The action is set via self._explain_action_idx before each explain() call.
-        self._explain_action_idx = 0
+        bg = background_X[:min(n_background, len(background_X))]
 
-        def _predict_single_action(X: np.ndarray) -> np.ndarray:
-            cate = self.model.const_marginal_effect(X)  # (n, K)
-            if self._explain_action_idx < cate.shape[1]:
-                return cate[:, self._explain_action_idx]
-            # Reference category → CATE is identically 0
-            return np.zeros(len(X))
-
-        # Use a sample of the background to keep SHAP fast
-        bg = X_background[:min(100, len(X_background))]
+        # shap.Explainer автоматически выбирает TreeExplainer для RF-based DML,
+        # что на порядок быстрее KernelExplainer.
         self.explainer = shap.Explainer(
-            _predict_single_action,
+            _predict_fn,
             bg,
             feature_names=feature_names,
         )
+        # Базовое значение (среднее CATE по фоновой выборке)
+        self.base_value: Optional[float] = None
 
-    def _set_action(self, action: str):
-        """Select which treatment column to explain."""
-        if action not in self.treatment_name_to_idx:
-            raise ValueError(f"Action '{action}' not available. "
-                             f"Available: {self.available_treatment_names}")
-        self._explain_action_idx = self.treatment_name_to_idx[action]
+    # ------------------------------------------------------------------
+    # Core
+    # ------------------------------------------------------------------
 
-    def explain(self, X: np.ndarray, action: str = None):
-        """Return SHAP values for X.
+    def explain(self, X: np.ndarray) -> shap.Explanation:
+        """Вычисляет SHAP-значения для матрицы X.
 
         Parameters
         ----------
-        X      : np.ndarray – preprocessed feature matrix (n, n_features).
-        action : str        – which action to explain; defaults to first available.
+        X : np.ndarray shape (n, n_features) — предобработанные признаки.
+
+        Returns
+        -------
+        shap.Explanation — объект с .values, .base_values, .data.
         """
-        if action is None:
-            action = self.available_treatment_names[0]
-        self._set_action(action)
-        return self.explainer(X)
+        exp = self.explainer(X)
+        # Кэшируем базовое значение для внешнего использования
+        if self.base_value is None and hasattr(exp, 'base_values'):
+            bv = exp.base_values
+            self.base_value = float(np.mean(bv)) if bv is not None else None
+        return exp
 
-    def plot_waterfall(self, X: np.ndarray, action: str = None,
-                       idx: int = 0, max_display: int = 10):
-        """Waterfall plot for sample at position idx.
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+
+    def plot_waterfall(
+        self,
+        X: np.ndarray,
+        idx: int = 0,
+        max_display: int = 10,
+    ) -> plt.Figure:
+        """Waterfall-график вклада признаков для одного наблюдения.
 
         Parameters
         ----------
-        X          : np.ndarray – preprocessed features.
-        action     : str        – treatment action to explain.
-        idx        : int        – row index to visualise.
-        max_display: int        – max features to show.
+        X           : np.ndarray — предобработанные признаки.
+        idx         : int — индекс строки в X.
+        max_display : int — максимальное число признаков на графике.
 
         Returns
         -------
         matplotlib.figure.Figure
         """
-        if action is None:
-            action = self.available_treatment_names[0]
-        shap_values = self.explain(X, action=action)
+        exp = self.explain(X)
         fig, ax = plt.subplots(figsize=(10, 5))
         plt.sca(ax)
-        shap.waterfall_plot(shap_values[idx], max_display=max_display, show=False)
-        ax.set_title(f"SHAP contribution to CATE — action: {action}", fontsize=10)
+        shap.waterfall_plot(exp[idx], max_display=max_display, show=False)
+        title = f"SHAP — вклад признаков в CATE"
+        if self.action_name:
+            title += f"\nДействие: {self.action_name}"
+        if self.outcome_name:
+            title += f"  |  Исход: {self.outcome_name}"
+        ax.set_title(title, fontsize=10, pad=8)
         plt.tight_layout()
         return fig
 
-    def plot_summary(self, X: np.ndarray, action: str = None):
-        """Beeswarm summary plot across all samples.
+    def plot_summary(
+        self,
+        X: np.ndarray,
+        max_display: int = 15,
+    ) -> plt.Figure:
+        """Beeswarm-график распределения SHAP-значений по всей выборке.
+
+        Parameters
+        ----------
+        X           : np.ndarray — предобработанные признаки.
+        max_display : int — максимальное число признаков.
 
         Returns
         -------
         matplotlib.figure.Figure
         """
-        if action is None:
-            action = self.available_treatment_names[0]
-        shap_values = self.explain(X, action=action)
+        exp = self.explain(X)
         fig, ax = plt.subplots(figsize=(10, 6))
         plt.sca(ax)
-        shap.summary_plot(shap_values, X, feature_names=self.feature_names, show=False)
-        ax.set_title(f"SHAP summary — action: {action}", fontsize=10)
+        shap.summary_plot(
+            exp.values,
+            X,
+            feature_names=self.feature_names,
+            max_display=max_display,
+            show=False,
+        )
+        title = "SHAP summary"
+        if self.action_name:
+            title += f" — {self.action_name}"
+        if self.outcome_name:
+            title += f" / {self.outcome_name}"
+        ax.set_title(title, fontsize=10)
         plt.tight_layout()
         return fig
+
+    def plot_bar(
+        self,
+        X: np.ndarray,
+        max_display: int = 15,
+    ) -> plt.Figure:
+        """Bar-chart средних |SHAP|-значений (глобальная важность признаков).
+
+        Parameters
+        ----------
+        X           : np.ndarray — предобработанные признаки.
+        max_display : int — максимальное число признаков.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+        """
+        exp = self.explain(X)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        plt.sca(ax)
+        shap.plots.bar(exp, max_display=max_display, show=False)
+        title = "SHAP — глобальная важность признаков"
+        if self.action_name:
+            title += f"\n{self.action_name}"
+        if self.outcome_name:
+            title += f" / {self.outcome_name}"
+        ax.set_title(title, fontsize=10)
+        plt.tight_layout()
+        return fig
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Фабричная функция
+# ──────────────────────────────────────────────────────────────────────
+
+def make_interpreter(
+    trainer,
+    action: str,
+    outcome: str,
+    background_X: np.ndarray,
+    n_background: int = 100,
+) -> ModelInterpreter:
+    """Создаёт ModelInterpreter для пары (action, outcome) из обученного trainer.
+
+    Parameters
+    ----------
+    trainer      : CausalModelTrainer из causal_model1.py (уже обученный).
+    action       : str — название действия (должно быть в trainer.models).
+    outcome      : str — название исхода (например 'salary_2y').
+    background_X : np.ndarray — фоновая выборка после OHE (из X_full.values).
+    n_background : int — размер фоновой выборки для SHAP.
+
+    Returns
+    -------
+    ModelInterpreter
+
+    Raises
+    ------
+    ValueError если действие или исход не найдены в trainer.
+    """
+    if not trainer.is_fitted:
+        raise ValueError("Trainer не обучен. Вызовите trainer.fit() перед созданием интерпретатора.")
+
+    if action not in trainer.models:
+        available = list(trainer.models.keys())
+        raise ValueError(
+            f"Действие '{action}' не найдено в trainer.models.\n"
+            f"Доступные действия: {available}"
+        )
+
+    if outcome not in trainer.models[action]:
+        available = list(trainer.models[action].keys())
+        raise ValueError(
+            f"Исход '{outcome}' не найден для действия '{action}'.\n"
+            f"Доступные исходы: {available}"
+        )
+
+    model = trainer.models[action][outcome]
+    feature_names = trainer.feature_names_after_ohe
+
+    return ModelInterpreter(
+        model=model,
+        background_X=background_X,
+        feature_names=feature_names,
+        action_name=action,
+        outcome_name=outcome,
+        n_background=n_background,
+    )
