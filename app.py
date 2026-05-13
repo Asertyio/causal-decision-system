@@ -11,7 +11,7 @@ from sklearn.model_selection import train_test_split
 
 from data_synthetic import generate_career_data
 from causal_model import CausalModelTrainer, get_default_feature_cols, BASELINE_ACTION
-from services.prediction_service import (
+from servicesprediction_service import (
     get_all_outcome_columns,
     resolve_outcome_columns,
     prepare_user_features,
