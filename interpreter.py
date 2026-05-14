@@ -1,7 +1,7 @@
 # interpreter.py
 """SHAP-интерпретатор для бинарных CausalForestDML моделей карьерного советника.
 
-Совместим с архитектурой causal_model1.py:
+Совместим с архитектурой causal_model.py:
   trainer.models[action][outcome] = CausalForestDML (бинарный T∈{0,1})
   trainer.baseline_models[outcome] = RandomForestRegressor
 
@@ -48,14 +48,17 @@ class ModelInterpreter:
         self.outcome_name = outcome_name
 
         # Обёртка: бинарный DML возвращает (n,) или (n,1) → всегда (n,)
+        # atleast_1d критичен: без него одиночная строка схлопывается в скаляр,
+        # и SHAP падает с ошибкой размерности.
         def _predict_fn(X: np.ndarray) -> np.ndarray:
             cate = model.const_marginal_effect(X)
-            return np.squeeze(cate)  # (n,)
+            return np.atleast_1d(np.squeeze(cate))  # (n,)
 
         bg = background_X[:min(n_background, len(background_X))]
 
-        # shap.Explainer автоматически выбирает TreeExplainer для RF-based DML,
-        # что на порядок быстрее KernelExplainer.
+        # Примечание: shap.Explainer получает функцию-обёртку, поэтому
+        # выбирает KernelExplainer (а не TreeExplainer — тот требует объект модели).
+        # Для ускорения передавайте небольшой bg (n_background=50–100).
         self.explainer = shap.Explainer(
             _predict_fn,
             bg,
@@ -109,10 +112,13 @@ class ModelInterpreter:
         matplotlib.figure.Figure
         """
         exp = self.explain(X)
-        fig, ax = plt.subplots(figsize=(10, 5))
-        plt.sca(ax)
+        # shap.waterfall_plot создаёт свою фигуру внутри — получаем её через gcf()
+        # после вызова, а не создаём заранее (иначе set_title применится к пустой фигуре).
+        matplotlib.use('Agg')
         shap.waterfall_plot(exp[idx], max_display=max_display, show=False)
-        title = f"SHAP — вклад признаков в CATE"
+        fig = plt.gcf()
+        ax = fig.axes[0] if fig.axes else fig.add_subplot(111)
+        title = "SHAP — вклад признаков в CATE"
         if self.action_name:
             title += f"\nДействие: {self.action_name}"
         if self.outcome_name:
@@ -138,8 +144,7 @@ class ModelInterpreter:
         matplotlib.figure.Figure
         """
         exp = self.explain(X)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        plt.sca(ax)
+        # shap.summary_plot создаёт свою фигуру — получаем её через gcf()
         shap.summary_plot(
             exp.values,
             X,
@@ -147,6 +152,8 @@ class ModelInterpreter:
             max_display=max_display,
             show=False,
         )
+        fig = plt.gcf()
+        ax = fig.axes[0] if fig.axes else fig.add_subplot(111)
         title = "SHAP summary"
         if self.action_name:
             title += f" — {self.action_name}"
@@ -173,9 +180,10 @@ class ModelInterpreter:
         matplotlib.figure.Figure
         """
         exp = self.explain(X)
-        fig, ax = plt.subplots(figsize=(10, 5))
-        plt.sca(ax)
+        # shap.plots.bar создаёт свою фигуру — получаем её через gcf()
         shap.plots.bar(exp, max_display=max_display, show=False)
+        fig = plt.gcf()
+        ax = fig.axes[0] if fig.axes else fig.add_subplot(111)
         title = "SHAP — глобальная важность признаков"
         if self.action_name:
             title += f"\n{self.action_name}"
@@ -201,7 +209,7 @@ def make_interpreter(
 
     Parameters
     ----------
-    trainer      : CausalModelTrainer из causal_model1.py (уже обученный).
+    trainer      : CausalModelTrainer из causal_model.py (уже обученный).
     action       : str — название действия (должно быть в trainer.models).
     outcome      : str — название исхода (например 'salary_2y').
     background_X : np.ndarray — фоновая выборка после OHE (из X_full.values).

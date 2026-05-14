@@ -44,7 +44,7 @@ def _compute_propensity_scores(age, total_experience, education_years, job_level
                                 skills_count, job_satisfaction, current_salary,
                                 is_moscow, gender) -> np.ndarray:
     n = len(age)
-    base_log_odds = np.zeros((n, 30))
+    base_log_odds = np.zeros((n, len(ALL_ACTIONS)))
     # Логика как в исходном файле без изменений
     base_log_odds[:, 0] = 1.0 + 0.03 * (age - 35) - 0.15 * job_satisfaction
     base_log_odds[:, 1] = 0.5 + 0.02 * skills_count - 0.01 * np.clip(age - 25, 0, None)
@@ -187,11 +187,10 @@ def generate_career_data(n=10000, random_state=42):
     industry_mult = np.ones(n)
     high_pay = ['IT и разработка ПО', 'Нефтегазовая отрасль', 'Финансы и банки', 'Добыча полезных ископаемых']
     low_pay = ['Образование', 'НКО и благотворительность', 'Социальное обслуживание', 'Библиотечное дело']
-    for i, ind in enumerate(current_industry):
-        if ind in high_pay:
-            industry_mult[i] = 1.7
-        elif ind in low_pay:
-            industry_mult[i] = 0.75
+    high_pay_mask = np.isin(current_industry, high_pay)
+    low_pay_mask  = np.isin(current_industry, low_pay)
+    industry_mult[high_pay_mask] = 1.7
+    industry_mult[low_pay_mask]  = 0.75
 
     exp_bonus = 2.0 * np.sqrt(total_experience)
     edu_bonus = education_years * 1.8
@@ -527,18 +526,23 @@ def generate_career_data(n=10000, random_state=42):
                 for _ in range(needed):
                     row = df.sample(1).iloc[0].to_dict()
                     row['treatment'] = action
-                    # лёгкий шум для числовых признаков
-                    for col in ['age', 'total_experience', 'current_salary']:
+                    # лёгкий шум для числовых признаков (age остаётся целым)
+                    if 'age' in row:
+                        row['age'] = int(row['age']) + np.random.randint(-1, 2)
+                    for col in ['total_experience', 'current_salary']:
                         if col in row:
-                            row[col] += np.random.normal(0, 0.1)
+                            row[col] += np.random.normal(0, 0.5)
                     synthetic_rows.append(row)
                 df = pd.concat([df, pd.DataFrame(synthetic_rows)], ignore_index=True)
             else:
-                duplicates = existing.sample(n=needed, replace=True)
+                duplicates = existing.sample(n=needed, replace=True).copy()
                 # немного шумим числовые признаки, чтобы избежать точных копий
-                for col in ['age', 'total_experience', 'current_salary']:
+                if 'age' in duplicates.columns:
+                    duplicates['age'] = (duplicates['age'].astype(int) +
+                                         np.random.randint(-1, 2, size=len(duplicates)))
+                for col in ['total_experience', 'current_salary']:
                     if col in duplicates.columns:
-                        duplicates[col] += np.random.normal(0, 0.1, size=len(duplicates))
+                        duplicates[col] = duplicates[col] + np.random.normal(0, 0.5, size=len(duplicates))
                 df = pd.concat([df, duplicates], ignore_index=True)
 
     return df

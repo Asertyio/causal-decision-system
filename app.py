@@ -310,9 +310,31 @@ with tab_main:
             if baseline_action not in effects[oc['salary']]['effect'].columns:
                 baseline_action = effects[oc['salary']]['effect'].columns[0]
 
+            # Сохраняем результаты в session_state для использования вне spinner
+            st.session_state['_pred_effects'] = effects
+            st.session_state['_pred_confidence'] = confidence
+            st.session_state['_pred_baseline_action'] = baseline_action
+            st.session_state['_pred_education_years'] = education_years
+            st.session_state['_pred_user_df'] = user_df
+            st.session_state['_pred_done'] = True
+            st.session_state['_pred_horizon'] = horizon
+            st.session_state['_pred_oc'] = oc
+            st.session_state['_pred_selected_actions'] = selected_actions
+
+    # ── Отображение результатов (вне spinner, но внутри if submitted-результаты) ──
+    if st.session_state.get('_pred_done'):
+        effects          = st.session_state['_pred_effects']
+        confidence       = st.session_state['_pred_confidence']
+        baseline_action  = st.session_state['_pred_baseline_action']
+        education_years  = st.session_state['_pred_education_years']
+        user_df          = st.session_state['_pred_user_df']
+        _horizon         = st.session_state['_pred_horizon']
+        oc               = st.session_state['_pred_oc']
+        selected_actions = st.session_state['_pred_selected_actions']
+
         # ── Метрики для каждого выбранного действия ──
         st.markdown("---")
-        st.subheader(f"📊 Прогноз: {horizon}")
+        st.subheader(f"📊 Прогноз: {_horizon}")
 
         for act in selected_actions:
             if act not in effects[oc['salary']]['effect'].columns:

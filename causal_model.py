@@ -133,7 +133,16 @@ class CausalModelTrainer:
 
         # Baseline subset
         baseline_mask = data[treatment_col] == baseline
+        if baseline_mask.sum() == 0:
+            raise ValueError(
+                f"В данных нет ни одного наблюдения с baseline-действием '{baseline}'. "
+                "Проверьте колонку treatment."
+            )
         X_base = X_full[baseline_mask].values
+
+        # Минимальное число treated-наблюдений для безопасного обучения CausalForestDML
+        # При cv=2 нужно минимум 2 * min_samples_leaf наблюдений в каждой группе
+        _min_treated = max(10, 2 * params['min_samples_leaf'])
 
         # Обучаем персонализированные baseline-модели для каждого исхода
         for outcome in outcome_cols:
@@ -159,7 +168,7 @@ class CausalModelTrainer:
             if action == baseline:
                 continue
             treated_mask = data[treatment_col] == action
-            if treated_mask.sum() < 5:
+            if treated_mask.sum() < _min_treated:
                 continue
             combined_mask = baseline_mask | treated_mask
             X_comb = X_full[combined_mask].values
@@ -205,11 +214,12 @@ class CausalModelTrainer:
         if not self.is_fitted:
             raise ValueError("Модель не обучена. Вызовите fit().")
 
-        # One-hot encoding
+        # One-hot encoding — добавляем отсутствующие колонки, убираем лишние
         X_proc = pd.get_dummies(X_df, drop_first=True)
         for col in self.feature_names_after_ohe:
             if col not in X_proc.columns:
                 X_proc[col] = 0
+        # Оставляем только колонки, известные модели, в правильном порядке
         X_proc = X_proc[self.feature_names_after_ohe].reset_index(drop=True)
         X_arr = X_proc.values
 
@@ -231,7 +241,6 @@ class CausalModelTrainer:
                 base_pred = np.full(len(X_arr), self.baseline_means.get(outcome, 0.0))
 
             for act in actions:
-                n = len(X_arr)
                 if act == BASELINE_ACTION or act not in self.models:
                     # Для baseline CATE = 0
                     results[outcome]['effect'][act] = base_pred.copy()
@@ -239,11 +248,10 @@ class CausalModelTrainer:
                     results[outcome]['upper'][act] = base_pred.copy()
                 else:
                     model = self.models[act][outcome]
-                    cate = model.const_marginal_effect(X_arr)
-                    cate = np.squeeze(cate)
+                    cate = np.atleast_1d(np.squeeze(model.const_marginal_effect(X_arr)))
                     cate_lo, cate_hi = model.const_marginal_effect_interval(X_arr, alpha=alpha)
-                    cate_lo = np.squeeze(cate_lo)
-                    cate_hi = np.squeeze(cate_hi)
+                    cate_lo = np.atleast_1d(np.squeeze(cate_lo))
+                    cate_hi = np.atleast_1d(np.squeeze(cate_hi))
                     results[outcome]['effect'][act] = base_pred + cate
                     results[outcome]['lower'][act] = base_pred + cate_lo
                     results[outcome]['upper'][act] = base_pred + cate_hi
@@ -256,7 +264,7 @@ class CausalModelTrainer:
         return results
 
     def predict_with_confidence(self, X_df: pd.DataFrame, actions: list = None,
-                                alpha: float = 0.05) -> dict:
+                                alpha: float = 0.05) -> tuple:
         raw = self.predict_absolute(X_df, actions=actions, alpha=alpha)
         confidence = {}
         for outcome, data in raw.items():

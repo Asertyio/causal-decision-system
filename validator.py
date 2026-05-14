@@ -11,7 +11,6 @@ import pandas as pd
 from sklearn.metrics import mean_squared_error, r2_score
 from scipy.stats import pearsonr
 
-from data_synthetic import generate_career_data
 from causal_model import CausalModelTrainer, get_default_feature_cols, BASELINE_ACTION
 
 
@@ -68,7 +67,8 @@ def placebo_test(
     dict с ключами:
         'mean_ate'  — среднее ATE по перестановкам,
         'std_ate'   — стандартное отклонение ATE,
-        'p_value'   — двусторонний p-value (доля случаев |ATE| ≥ наблюдаемого),
+        'p_value'   — двусторонний знаковый p-value: доля перестановок
+                      с противоположным знаком ATE (×2, ограничено 1.0),
         'ate_list'  — список ATE по каждой перестановке.
     """
     rng = np.random.default_rng(random_state)
@@ -92,12 +92,25 @@ def placebo_test(
         # Предсказываем на небольшой подвыборке для скорости
         X_sample = data_perm[feature_cols].head(200)
         preds = temp_trainer.predict_absolute(X_sample)
-        ate = float(preds[first_outcome]['effect'].values.mean())
+        effect_df = preds[first_outcome]['effect']
+        # ATE = среднее CATE первого не-baseline действия в этой перестановке.
+        # .values.mean() на всём DataFrame усреднял бы все действия сразу — неверно.
+        non_bl_cols = [c for c in effect_df.columns if c != BASELINE_ACTION]
+        ate_col = non_bl_cols[0] if non_bl_cols else effect_df.columns[0]
+        ate = float(effect_df[ate_col].mean())
         ate_list.append(ate)
         print(f"  Placebo [{perm_idx + 1}/{n_permutations}]: ATE={ate:.3f}")
 
     ate_arr = np.array(ate_list)
-    p_value = float(2 * min(np.mean(ate_arr >= 0), np.mean(ate_arr <= 0)))
+    # p-value: доля перестановок, в которых |ATE| отличен от нуля в ту же сторону,
+    # что и среднее (знаковый тест). Низкий p-value означает систематический эффект
+    # даже при случайных лейблах — признак утечки или переобучения.
+    mean_ate = float(np.mean(ate_arr))
+    if mean_ate >= 0:
+        p_value = float(np.mean(ate_arr <= 0))   # доля перестановок с противоположным знаком
+    else:
+        p_value = float(np.mean(ate_arr >= 0))
+    p_value = float(min(2 * p_value, 1.0))        # двусторонняя поправка, не > 1
 
     return {
         'mean_ate': float(np.mean(ate_arr)),
@@ -178,6 +191,10 @@ def calibration_test(
 
         # Разбиваем на бины по квантилям предсказанного CATE
         bin_edges = np.percentile(cate_pred, np.linspace(0, 100, n_bins + 1))
+        # Если все предсказания одинаковы — бины вырождены, пропускаем действие
+        if np.all(bin_edges == bin_edges[0]):
+            print(f"  calibration_test: константный CATE для '{action}', действие пропущено.")
+            continue
         # digitize: бины 1..n_bins
         bin_idx = np.digitize(cate_pred, bin_edges[:-1])
 

@@ -36,7 +36,15 @@ def preprocess_hr_data(df: pd.DataFrame):
 
     X_cols = ['Age', 'Education', 'JobSatisfaction', 'StockOptionLevel',
               'YearsAtCompany', 'YearsInCurrentRole']
-    df['OverTime'] = df['OverTime'].map({'Yes': 1, 'No': 0})
+    # Оставляем только колонки, которые реально присутствуют в датасете
+    # (kagglehub и GitHub-версии CSV могут отличаться именованием)
+    X_cols = [c for c in X_cols if c in df.columns]
+    if not X_cols:
+        raise ValueError(
+            "HR-датасет не содержит ожидаемых признаков. "
+            "Проверьте источник данных и именование колонок."
+        )
+    df['OverTime'] = df['OverTime'].map({'Yes': 1, 'No': 0}).fillna(0).astype(int)
     df = pd.get_dummies(df, columns=['Department', 'JobRole'], drop_first=True)
 
     W_ohe_cols = [c for c in df.columns if c.startswith('Department_') or c.startswith('JobRole_')]
@@ -68,21 +76,29 @@ def load_and_prepare_data(data_source: str = 'synthetic', n_synthetic: int = 500
 
     Returns
     -------
-    For 'synthetic': (df, feature_cols, outcome_cols)
-    For 'hr':        (X, W, T, Y, None, feature_names_X, feature_names_W)
+    'synthetic' : tuple[pd.DataFrame, list[str], list[str]]
+        (df, feature_cols, outcome_cols)
+        feature_cols — признаки без утечки (leaky cols исключены)
+        outcome_cols — все горизонты: 6m, 1y, 2y для salary/satisfaction/promoted/wlb
+    'hr' : tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, None, list[str], list[str]]
+        (X_scaled, W_scaled, T, Y, None, feature_names_X, feature_names_W)
     """
     if data_source == 'synthetic':
         # BUG FIX: was calling non-existent generate_synthetic_data(); now uses generate_career_data()
         from data_synthetic import generate_career_data
+        from prediction_service import get_all_outcome_columns
         df = generate_career_data(n=n_synthetic)
+        # current_salary / job_satisfaction / work_life_balance исключены:
+        # они внесены в _LEAKY_COLS в causal_model.py и молча выбрасываются при обучении.
         feature_cols = [
             'age', 'gender', 'region', 'education_years', 'has_master', 'has_phd',
             'has_certificate', 'total_experience', 'industry_experience',
             'current_job_tenure', 'num_previous_jobs', 'current_industry',
-            'job_level', 'skills_count', 'current_salary', 'job_satisfaction',
-            'work_life_balance', 'experience_gap', 'job_stability'
+            'job_level', 'skills_count', 'experience_gap', 'job_stability',
+            'age_x_skills', 'exp_x_edu',
         ]
-        outcome_cols = ['salary_2y', 'satisfaction_2y', 'promoted_2y', 'wlb_2y']
+        # Все горизонты 6m/1y/2y — иначе модель обучается только на 2y
+        outcome_cols = get_all_outcome_columns()
         return df, feature_cols, outcome_cols
 
     elif data_source == 'hr':

@@ -4,8 +4,7 @@
 """
 import pandas as pd
 import numpy as np
-from interpreter import ModelInterpreter
-from causal_model import CausalModelTrainer, BASELINE_ACTION
+import shap
 
 # Маппинг горизонтов
 HORIZON_MAP = {
@@ -27,8 +26,13 @@ def get_all_outcome_columns():
     return cols
 
 
-def resolve_outcome_columns(available_outcomes, horizon_key):
-    """Возвращает словарь col_name для выбранного горизонта с fallback на 2y."""
+def resolve_outcome_columns(available_outcomes: list, horizon_key: str) -> dict:
+    """Возвращает словарь col_name для выбранного горизонта с fallback на 2y.
+
+    Raises
+    ------
+    ValueError если ни целевая колонка, ни fallback не найдены для какого-либо метрика.
+    """
     oc = {}
     for metric in METRICS:
         col = f'{metric}_{horizon_key}'
@@ -36,7 +40,13 @@ def resolve_outcome_columns(available_outcomes, horizon_key):
             oc[metric] = col
         else:
             fallback = f'{metric}_2y'
-            oc[metric] = fallback if fallback in available_outcomes else None
+            if fallback in available_outcomes:
+                oc[metric] = fallback
+            else:
+                raise ValueError(
+                    f"Ни '{col}', ни fallback '{fallback}' не найдены в available_outcomes. "
+                    f"Доступные исходы: {available_outcomes}"
+                )
     return oc
 
 
@@ -66,20 +76,47 @@ def prepare_user_features(age, gender, region, education_years, has_master, has_
     }])
 
 
-def get_shap_explanation(trainer, user_X_proc, action, outcome='salary_2y'):
-    """Возвращает объект SHAP-значений для одного пользователя и действия."""
+def get_shap_explanation(trainer, user_X_proc, action, outcome='salary_2y',
+                         background_X: np.ndarray = None):
+    """Возвращает объект SHAP-значений для одного пользователя и действия.
+
+    Parameters
+    ----------
+    trainer       : обученный CausalModelTrainer.
+    user_X_proc   : pd.DataFrame — признаки пользователя после OHE (1 строка).
+    action        : str — название действия.
+    outcome       : str — название исхода, например 'salary_2y'.
+    background_X  : np.ndarray — фоновая выборка для KernelExplainer.
+                    Должна содержать репрезентативную выборку из обучающих данных
+                    (рекомендуется 50–200 строк). Если None — используется
+                    среднее значение признаков пользователя как заглушка
+                    (низкое качество объяснений).
+
+    Returns
+    -------
+    shap.Explanation или None если действие/исход недоступны.
+    """
     if action not in trainer.models or outcome not in trainer.models[action]:
         return None
     model = trainer.models[action][outcome]
     feature_names = trainer.feature_names_after_ohe
-    # Используем KernelExplainer через функцию const_marginal_effect
-    # (возвращает 1D массив для бинарного лечения)
-    def predict_fn(X):
-        return model.const_marginal_effect(X).ravel()
-    # background: берём средний профиль (или несколько строк) из обученных данных
-    # можно использовать среднее значение X (но в виде массива)
-    bg = user_X_proc.values[:1]  # простая заглушка, лучше сохранённый образец
+
+    # atleast_1d критичен: ravel() на одной строке даёт скаляр,
+    # что ломает KernelExplainer
+    def predict_fn(X: np.ndarray) -> np.ndarray:
+        return np.atleast_1d(model.const_marginal_effect(X).ravel())
+
+    # Используем переданный фон или среднее пользователя как заглушку
+    if background_X is not None:
+        bg = background_X
+    else:
+        bg = user_X_proc.values  # заглушка низкого качества — передайте background_X
+
     explainer = shap.KernelExplainer(predict_fn, bg)
     shap_values = explainer.shap_values(user_X_proc.values)
-    return shap.Explanation(values=shap_values, base_values=explainer.expected_value,
-                            data=user_X_proc.values, feature_names=feature_names)
+    return shap.Explanation(
+        values=shap_values,
+        base_values=explainer.expected_value,
+        data=user_X_proc.values,
+        feature_names=feature_names,
+    )
