@@ -101,21 +101,37 @@ class CausalModelTrainer:
 
     def _get_model_params(self):
         if self.high_precision:
+            # Баланс качество/время: разумные результаты без многочасового ожидания.
+            # 30 действий × 12 исходов = 360 моделей — держим параметры умеренными.
             return {
-                "cv": 3,
-                "max_depth": 15,
-                "min_samples_leaf": 10,
-                "n_estimators": 150,
-                "n_estimators_first": 200,
+                "cv": 2,            # 3 → 2: экономия ~33% времени на cross-fit
+                "max_depth": 8,     # достаточно для захвата нелинейностей
+                "min_samples_leaf": 20,
+                "n_estimators": 40, # кратно 4; 152 деревьев на 360 моделей — слишком долго
+                "n_estimators_first": 60,
+                "honest": True,     # честное разбиение — для качества важно
+                "inference": True,  # доверительные интервалы нужны
             }
         else:
+            # Максимальная скорость: минимум деревьев, нет honest-сплита,
+            # нет inference при обучении — только быстрые предсказания.
             return {
                 "cv": 2,
-                "max_depth": 6,
-                "min_samples_leaf": 30,
-                "n_estimators": 40,
-                "n_estimators_first": 80,       # увеличено с 20 до 80
+                "max_depth": 4,
+                "min_samples_leaf": 50,
+                "n_estimators": 8,  # минимум кратный 4; достаточно для smoke-test
+                "n_estimators_first": 16,
+                "honest": False,    # без сплита на честность — в 2× быстрее
+                "inference": False, # не считать дисперсию при fit — ещё быстрее
             }
+
+    @staticmethod
+    def _round_estimators(n: int, subforest_size: int = 4) -> int:
+        """Округляет n_estimators вверх до кратного subforest_size.
+        CausalForestDML требует n_estimators % subforest_size == 0.
+        """
+        remainder = n % subforest_size
+        return n if remainder == 0 else n + (subforest_size - remainder)
 
     def fit(self, data: pd.DataFrame, outcome_cols: list, treatment_col: str = 'treatment',
             feature_cols: list = None):
@@ -145,13 +161,14 @@ class CausalModelTrainer:
         _min_treated = max(10, 2 * params['min_samples_leaf'])
 
         # Обучаем персонализированные baseline-модели для каждого исхода
+        # В fast-режиме берём меньше деревьев для baseline RF
+        _baseline_n_est = params['n_estimators_first']
         for outcome in outcome_cols:
             y_base = data.loc[baseline_mask, outcome].values.astype(float)
             self.baseline_means[outcome] = float(y_base.mean()) if len(y_base) > 0 else 0.0
-            # Обучаем RandomForestRegressor для предсказания базового исхода
             if len(y_base) > 10:
                 reg = RandomForestRegressor(
-                    n_estimators=min(100, params['n_estimators_first']),
+                    n_estimators=_baseline_n_est,
                     max_depth=params['max_depth'],
                     min_samples_leaf=params['min_samples_leaf'],
                     random_state=self.random_state,
@@ -181,18 +198,22 @@ class CausalModelTrainer:
                 model = CausalForestDML(
                     model_y=RandomForestRegressor(
                         n_estimators=params['n_estimators_first'],
-                        random_state=self.random_state,
+                        max_depth=params['max_depth'],
                         min_samples_leaf=params['min_samples_leaf'],
+                        random_state=self.random_state,
                         n_jobs=-1),
                     model_t=RandomForestClassifier(
                         n_estimators=params['n_estimators_first'],
-                        random_state=self.random_state,
+                        max_depth=params['max_depth'],
                         min_samples_leaf=params['min_samples_leaf'],
+                        random_state=self.random_state,
                         n_jobs=-1),
                     discrete_treatment=True,
                     cv=params['cv'],
-                    honest=True,
-                    n_estimators=params['n_estimators'],
+                    honest=params['honest'],
+                    inference=params['inference'],
+                    # Округляем до кратного subforest_size=4 — требование CausalForestDML
+                    n_estimators=self._round_estimators(params['n_estimators']),
                     min_samples_leaf=params['min_samples_leaf'],
                     max_depth=params['max_depth'],
                     random_state=self.random_state,
@@ -249,9 +270,14 @@ class CausalModelTrainer:
                 else:
                     model = self.models[act][outcome]
                     cate = np.atleast_1d(np.squeeze(model.const_marginal_effect(X_arr)))
-                    cate_lo, cate_hi = model.const_marginal_effect_interval(X_arr, alpha=alpha)
-                    cate_lo = np.atleast_1d(np.squeeze(cate_lo))
-                    cate_hi = np.atleast_1d(np.squeeze(cate_hi))
+                    # inference=False (fast mode): интервалы недоступны — используем cate как lower/upper
+                    try:
+                        cate_lo, cate_hi = model.const_marginal_effect_interval(X_arr, alpha=alpha)
+                        cate_lo = np.atleast_1d(np.squeeze(cate_lo))
+                        cate_hi = np.atleast_1d(np.squeeze(cate_hi))
+                    except (AttributeError, Exception):
+                        cate_lo = cate.copy()
+                        cate_hi = cate.copy()
                     results[outcome]['effect'][act] = base_pred + cate
                     results[outcome]['lower'][act] = base_pred + cate_lo
                     results[outcome]['upper'][act] = base_pred + cate_hi
